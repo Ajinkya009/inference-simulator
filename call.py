@@ -27,19 +27,17 @@ from prompt import build_system_prompt, build_user_message
 
 
 async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,
-                   chars_per_token: float, rng: random.Random,
+                   tpw: float, rng: random.Random,
                    t_step_start: float,
                    emit: Callable[[int, int, float, TurnResult], None]) -> None:
     """Run one full call. `emit(call_idx, turn_idx, arrival_offset, result)`
     is called for every MEASURED turn (2..N)."""
-    system_prompt = build_system_prompt(cfg.system_prompt_tokens,
-                                         chars_per_token, rng)
+    system_prompt = build_system_prompt(cfg.system_prompt_tokens, tpw, rng)
     messages: List[dict] = [{"role": "system", "content": system_prompt}]
 
     # ---- turn 1: warm the prefix, response ignored ----------------------
     messages.append({"role": "user",
-                     "content": build_user_message(cfg.user_tokens, rng,
-                                                    chars_per_token)})
+                     "content": build_user_message(cfg.user_tokens, tpw, rng)})
     try:
         await stream_chat(client, cfg.model, messages,
                           max_tokens=cfg.warm_turn1_max_tokens,
@@ -48,8 +46,7 @@ async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,
         pass
     # Append the STATIC turn-1 assistant response (not from the LLM).
     messages.append({"role": "assistant",
-                     "content": build_user_message(cfg.static_response_tokens,
-                                                    rng, chars_per_token)})
+                     "content": build_user_message(cfg.static_response_tokens, tpw, rng)})
 
     # ---- turns 2..N: measured ------------------------------------------
     for turn_idx in range(2, cfg.turns + 1):
@@ -57,8 +54,7 @@ async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,
         await asyncio.sleep(gap)
 
         messages.append({"role": "user",
-                         "content": build_user_message(cfg.user_tokens, rng,
-                                                        chars_per_token)})
+                         "content": build_user_message(cfg.user_tokens, tpw, rng)})
         offset = time.perf_counter() - t_step_start
         res = await stream_chat(client, cfg.model, messages,
                                 max_tokens=cfg.output_tokens,
@@ -70,8 +66,7 @@ async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,
         if res.ok:
             messages.append({"role": "assistant",
                              "content": "(generated) " +
-                             build_user_message(cfg.output_tokens, rng,
-                                                chars_per_token)})
+                             build_user_message(cfg.output_tokens, tpw, rng)})
         else:
             # On failure, still advance history with a placeholder so token
             # accounting stays comparable.

@@ -84,17 +84,17 @@ async def _validate(cfg: Config):
         print(f"[validate] calibrating against {cfg.base_url} ...")
         cpt = await calibrate(client, cfg.model, rng)
         sp = build_system_prompt(cfg.system_prompt_tokens, cpt, rng)
-        print(f"[validate] chars/token={cpt:.3f}  sys_prompt_chars={len(sp)}")
+        print(f"[validate] tokens/word={cpt:.3f}  sys_prompt_chars={len(sp)}")
 
         # one warm + measured turn to confirm plumbing & cache behavior
         msgs = [{"role": "system", "content": sp},
-                {"role": "user", "content": build_user_message(cfg.user_tokens, rng, cpt)}]
+                {"role": "user", "content": build_user_message(cfg.user_tokens, cpt, rng)}]
         warm = await stream_chat(client, cfg.model, msgs, cfg.warm_turn1_max_tokens,
                                  False, cfg.temperature)
         print(f"[validate] turn1 (warm): ok={warm.ok} prompt_tok={warm.prompt_tokens} "
               f"cached={warm.cached_tokens} err={warm.error}")
-        msgs.append({"role": "assistant", "content": build_user_message(40, rng, cpt)})
-        msgs.append({"role": "user", "content": build_user_message(cfg.user_tokens, rng, cpt)})
+        msgs.append({"role": "assistant", "content": build_user_message(40, cpt, rng)})
+        msgs.append({"role": "user", "content": build_user_message(cfg.user_tokens, cpt, rng)})
         m = await stream_chat(client, cfg.model, msgs, cfg.output_tokens,
                               cfg.ignore_eos, cfg.temperature)
         print(f"[validate] turn2 (measured): ok={m.ok} TTFT={m.ttft_ms:.0f}ms "

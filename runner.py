@@ -32,7 +32,7 @@ def _make_client(cfg: Config, transport=None) -> httpx.AsyncClient:
 
 
 async def _run_step(cfg: Config, client: httpx.AsyncClient, lam: float,
-                    chars_per_token: float, rng: random.Random) -> StepStats:
+                    tpw: float, rng: random.Random) -> StepStats:
     collector = StepCollector(lam)
     inflight: set = set()
     t_step_start = time.perf_counter()
@@ -55,7 +55,7 @@ async def _run_step(cfg: Config, client: httpx.AsyncClient, lam: float,
     while time.perf_counter() < step_until:
         if len(inflight) < cfg.max_concurrent_calls:
             task = asyncio.create_task(
-                run_call(call_idx, client, cfg, chars_per_token,
+                run_call(call_idx, client, cfg, tpw,
                          rng, t_step_start, emit))
             inflight.add(task)
             task.add_done_callback(inflight.discard)
@@ -83,14 +83,14 @@ async def run_sweep(cfg: Config, progress=print, transport=None) -> List[StepSta
     results: List[StepStats] = []
     async with _make_client(cfg, transport=transport) as client:
         progress(f"[{cfg.label}] calibrating tokenizer against {cfg.base_url} ...")
-        cpt = await calibrate(client, cfg.model, rng)
-        progress(f"[{cfg.label}] chars/token = {cpt:.3f} "
+        tpw = await calibrate(client, cfg.model, rng)
+        progress(f"[{cfg.label}] tokens/word = {tpw:.3f} "
                  f"(target system prompt = {cfg.system_prompt_tokens} tok)")
 
         for lam in cfg.arrival_rates:
             progress(f"[{cfg.label}] lambda={lam:.3f} calls/s  "
                      f"(window {cfg.step_duration_s:.0f}s, warmup {cfg.warmup_s:.0f}s) ...")
-            stats = await _run_step(cfg, client, lam, cpt, rng)
+            stats = await _run_step(cfg, client, lam, tpw, rng)
             results.append(stats)
             progress(f"    -> turns={stats.n_turns} err={stats.error_rate:.1%} "
                      f"TTFT p95={stats.ttft_ms['p95']:.0f}ms "

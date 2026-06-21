@@ -1,16 +1,16 @@
 """Prompt construction.
 
-Two hard requirements from the production profile:
+Requirements from the production profile:
 
-1. The 18K system prompt is UNIQUE per call (not shared across calls). We
-   guarantee no accidental cross-call RadixAttention prefix sharing by making
-   the very first tokens a per-call UUID. Within a call the identical system
-   prompt is resent every turn, so the per-call prefix *is* reused across
-   turns 2..N (warm path) -- which is the whole point.
+1. The system prompt is UNIQUE per call (not shared across calls). We guarantee
+   no accidental cross-call RadixAttention prefix sharing by making the very
+   first tokens a per-call UUID. Within a call the identical system prompt is
+   resent every turn, so the per-call prefix IS reused across turns 2..N.
 
-2. We must land near a real 18K token count without the gated Gemma-4
-   tokenizer. We calibrate once at startup against the server's reported
-   usage.prompt_tokens and cache a chars-per-token ratio.
+2. We must land near the target token count without the gated Gemma-4 tokenizer.
+   We calibrate ONCE against the server's usage.prompt_tokens to get an accurate
+   tokens-per-word ratio, then size prompts in WORDS. (Earlier versions routed
+   through chars/token with a hardcoded chars/word and overshot ~40%.)
 """
 from __future__ import annotations
 
@@ -18,8 +18,6 @@ import random
 import uuid
 from typing import List
 
-# A varied word bank so filler tokenizes at a realistic (sub-1.0) ratio rather
-# than collapsing into repeated single tokens.
 _WORDS = (
     "system policy customer account balance overdue payment reminder schedule "
     "agent collections loan installment principal interest tenure escalation "
@@ -29,59 +27,60 @@ _WORDS = (
     "branch region tier priority sentiment objection rebuttal clarify confirm"
 ).split()
 
+_PROBE_WORDS = 4000          # calibration probe size
+_HEADER_TOKENS = 45          # rough token cost of the system header below
+_DEFAULT_TPW = 1.0           # fallback tokens-per-word if the probe fails
+
 
 def _filler(n_words: int, rng: random.Random) -> str:
     return " ".join(rng.choice(_WORDS) for _ in range(n_words))
 
 
-def build_system_prompt(target_tokens: int, chars_per_token: float,
+def build_system_prompt(target_tokens: int, tpw: float,
                         rng: random.Random) -> str:
-    """Build a unique system prompt of ~target_tokens.
-
-    chars_per_token comes from calibrate(); ~4.0 is a safe initial guess.
-    """
+    """Unique system prompt of ~target_tokens. `tpw` = tokens per word."""
     call_id = uuid.uuid4().hex  # unique prefix -> no cross-call sharing
     header = (
         f"### CALL {call_id}\n"
         "You are a Hindi-language voice collections agent. Follow policy "
         "strictly and keep responses concise.\n### KNOWLEDGE BASE\n"
     )
-    remaining_chars = max(0, int(target_tokens * chars_per_token) - len(header))
-    # ~6 chars per word incl. space.
-    n_words = max(1, remaining_chars // 6)
+    n_words = max(1, round((target_tokens - _HEADER_TOKENS) / max(tpw, 1e-6)))
     return header + _filler(n_words, rng)
 
 
-def build_user_message(n_tokens: int, rng: random.Random,
-                       chars_per_token: float) -> str:
-    n_words = max(1, int(n_tokens * chars_per_token) // 6)
+def build_user_message(n_tokens: int, tpw: float,
+                       rng: random.Random) -> str:
+    n_words = max(1, round(n_tokens / max(tpw, 1e-6)))
     return _filler(n_words, rng)
 
 
 async def calibrate(client, model: str, rng: random.Random) -> float:
-    """Measure chars-per-token on the live server. Returns chars/token.
+    """Return tokens-per-word measured on the live server.
 
-    Sends one cheap probe (max_tokens=1) and reads usage.prompt_tokens.
-    Falls back to 4.0 if the server doesn't return usage.
+    Sends one cheap probe (max_tokens=1) of known word count and reads
+    usage.prompt_tokens. Falls back to 1.0 if usage is unavailable.
     """
-    probe_text = _filler(4000, rng)  # ~4k words
+    probe_text = _filler(_PROBE_WORDS, rng)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": probe_text}],
         "max_tokens": 1,
         "temperature": 0.0,
         "stream": False,
+        "return_cached_tokens_details": True,
     }
     try:
         r = await client.post("/chat/completions", json=payload)
         r.raise_for_status()
         usage = r.json().get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        if prompt_tokens:
-            return len(probe_text) / prompt_tokens
+        pt = usage.get("prompt_tokens")
+        if pt:
+            # prompt_tokens includes a few template tokens; negligible at 4k words
+            return pt / _PROBE_WORDS
     except Exception as e:  # noqa: BLE001
-        print(f"[calibrate] probe failed ({e}); using default 4.0 chars/token")
-    return 4.0
+        print(f"[calibrate] probe failed ({e}); using default {_DEFAULT_TPW} tok/word")
+    return _DEFAULT_TPW
 
 
 def measured_prompt_tokens(usage: dict) -> int:
@@ -90,7 +89,7 @@ def measured_prompt_tokens(usage: dict) -> int:
 
 def cached_prompt_tokens(usage: dict) -> int:
     """SGLang reports prefix-cache hits via prompt_tokens_details.cached_tokens
-    (OpenAI-compatible). Defensive parse across field variants."""
+    (requires return_cached_tokens_details=True on the request)."""
     usage = usage or {}
     details = usage.get("prompt_tokens_details") or {}
     for k in ("cached_tokens", "cached"):

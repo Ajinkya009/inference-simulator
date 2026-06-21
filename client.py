@@ -48,6 +48,8 @@ async def stream_chat(client: httpx.AsyncClient, model: str,
     if ignore_eos:
         # SGLang extension: forces exactly max_tokens output for clean ITL.
         payload["ignore_eos"] = True
+    # SGLang: include cached_tokens in usage.prompt_tokens_details.
+    payload["return_cached_tokens_details"] = True
 
     t_start = time.perf_counter()
     first_tok_t: Optional[float] = None
