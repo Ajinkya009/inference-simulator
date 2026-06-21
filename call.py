@@ -21,9 +21,9 @@ from typing import Callable, List
 
 import httpx
 
-from .client import stream_chat, TurnResult
-from .config import Config
-from .prompt import build_system_prompt, build_user_message
+from client import stream_chat, TurnResult
+from config import Config
+from prompt import build_system_prompt, build_user_message
 
 
 async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,

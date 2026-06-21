@@ -13,12 +13,12 @@ import os
 import random
 import time
 
-from .config import Config, PRESETS
-from .runner import run_sweep, _make_client
-from .metrics import slo_knee, kneedle_knee, steps_to_rows
-from .prompt import calibrate, build_system_prompt, build_user_message
-from .call import run_call
-from .client import stream_chat
+from config import Config, PRESETS
+from runner import run_sweep, _make_client
+from metrics import slo_knee, kneedle_knee, steps_to_rows
+from prompt import calibrate, build_system_prompt, build_user_message
+from call import run_call
+from client import stream_chat
 
 
 def _apply_cli(cfg: Config, args) -> Config:
@@ -62,7 +62,7 @@ def _write_outputs(cfg: Config, steps):
             w.writerows(rows)
 
     try:
-        from .plot import plot_single
+        from plot import plot_single
         plot_single(steps, rows, cfg, base + ".png")
     except ImportError:
         print("[plot] plot.py not present; skipping PNG (CSV/JSON written)")
@@ -133,7 +133,7 @@ def main():
     args = p.parse_args()
 
     if args.cmd == "compare":
-        from .plot import plot_compare
+        from plot import plot_compare
         plot_compare(args.files, args.out, args.slo)
         return
 

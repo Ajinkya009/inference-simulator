@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional
 
-from .metrics import StepStats, slo_knee, kneedle_knee
+from metrics import StepStats, slo_knee, kneedle_knee
 
 
 def _load_series(rows: List[dict]):

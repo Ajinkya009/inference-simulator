@@ -17,7 +17,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from .client import TurnResult
+from client import TurnResult
 
 
 @dataclass

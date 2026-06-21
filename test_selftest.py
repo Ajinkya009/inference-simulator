@@ -7,9 +7,9 @@ TTFT/ITL capture path, Poisson driver, metrics, and knee detection.
 import asyncio, json, time
 import httpx
 
-from inference_simulator.config import Config
-from inference_simulator.runner import run_sweep
-from inference_simulator.metrics import slo_knee, kneedle_knee, steps_to_rows
+from config import Config
+from runner import run_sweep
+from metrics import slo_knee, kneedle_knee, steps_to_rows
 
 TTFT_BASE = 0.035
 KNEE_CONC = 8

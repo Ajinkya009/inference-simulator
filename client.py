@@ -100,7 +100,7 @@ async def stream_chat(client: httpx.AsyncClient, model: str,
         return TurnResult(ok=False, error="no tokens streamed",
                           total_s=time.perf_counter() - t_start)
 
-    from .prompt import measured_prompt_tokens, cached_prompt_tokens
+    from prompt import measured_prompt_tokens, cached_prompt_tokens
     return TurnResult(
         ok=True,
         ttft_ms=(first_tok_t - t_start) * 1000.0,
