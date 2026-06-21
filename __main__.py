@@ -1,8 +1,8 @@
 """CLI.
 
-  python -m voicesim sweep    --base-url http://HOST:30000/v1 --preset l40s --label L40S
-  python -m voicesim validate --base-url http://HOST:30000/v1   # 1 call, prints breakdown
-  python -m voicesim compare results/L40S.json results/H100.json -o results/compare.png
+  python -m inference_simulator sweep    --base-url http://HOST:30000/v1 --preset l40s --label L40S
+  python -m inference_simulator validate --base-url http://HOST:30000/v1   # 1 call, prints breakdown
+  python -m inference_simulator compare results/L40S.json results/H100.json -o results/compare.png
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import time
 from .config import Config, PRESETS
 from .runner import run_sweep, _make_client
 from .metrics import slo_knee, kneedle_knee, steps_to_rows
-from .plot import plot_single, plot_compare
 from .prompt import calibrate, build_system_prompt, build_user_message
 from .call import run_call
 from .client import stream_chat
@@ -62,7 +61,11 @@ def _write_outputs(cfg: Config, steps):
             w.writeheader()
             w.writerows(rows)
 
-    plot_single(steps, rows, cfg, base + ".png")
+    try:
+        from .plot import plot_single
+        plot_single(steps, rows, cfg, base + ".png")
+    except ImportError:
+        print("[plot] plot.py not present; skipping PNG (CSV/JSON written)")
 
     print("\n" + "=" * 64)
     print(f"  {cfg.label} KNEE SUMMARY")
@@ -106,7 +109,7 @@ async def _validate(cfg: Config):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="voicesim")
+    p = argparse.ArgumentParser(prog="inference-simulator")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
@@ -130,6 +133,7 @@ def main():
     args = p.parse_args()
 
     if args.cmd == "compare":
+        from .plot import plot_compare
         plot_compare(args.files, args.out, args.slo)
         return
 

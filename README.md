@@ -1,4 +1,4 @@
-# voicesim — voice-AI load simulator (knee finder)
+# inference-simulator — LLM serving load simulator (knee finder)
 
 A production-faithful, open-loop load generator for a self-hosted **Gemma 4 12B-it**
 voice agent on SGLang. It drives a real OpenAI-compatible endpoint with Poisson
@@ -31,7 +31,7 @@ warm calls** before eviction churns. An 80 GB H100 holds ~35–40 plus faster
 prefill/decode, so its knee lands much higher. The harness measures the truth;
 those numbers only seed sensible sweep ranges.
 
-## Assumptions (all configurable in `voicesim/config.py` or via CLI)
+## Assumptions (all configurable in `inference_simulator/config.py` or via CLI)
 
 | Knob | Default | Notes |
 |---|---|---|
@@ -58,7 +58,7 @@ uv pip install httpx numpy matplotlib    # matplotlib optional (plots)
 hits the cache before you spend GPU-hours):
 
 ```bash
-python -m voicesim validate --base-url http://YOUR_RUNPOD:30000/v1 --model gemma-4-12b-it
+python -m inference_simulator validate --base-url http://YOUR_RUNPOD:30000/v1 --model gemma-4-12b-it
 ```
 Look for `turn2 ... cached=~18000` and the `OK: turn-2 reused the warm prefix`
 line. If cache hit is low, prefix caching isn't engaging — fix that first.
@@ -66,10 +66,10 @@ line. If cache hit is low, prefix caching isn't engaging — fix that first.
 **2. Sweep to find the knee:**
 
 ```bash
-python -m voicesim sweep --base-url http://YOUR_RUNPOD:30000/v1 \
+python -m inference_simulator sweep --base-url http://YOUR_RUNPOD:30000/v1 \
     --model gemma-4-12b-it --preset l40s --label L40S
 # then on the H100 box:
-python -m voicesim sweep --base-url http://YOUR_H100:30000/v1 \
+python -m inference_simulator sweep --base-url http://YOUR_H100:30000/v1 \
     --model gemma-4-12b-it --preset h100 --label H100
 ```
 Writes `results/<LABEL>.{json,csv,png}` and prints a knee summary.
@@ -77,7 +77,7 @@ Writes `results/<LABEL>.{json,csv,png}` and prints a knee summary.
 **3. Compare GPUs:**
 
 ```bash
-python -m voicesim compare results/L40S.json results/H100.json -o results/compare.png
+python -m inference_simulator compare results/L40S.json results/H100.json -o results/compare.png
 ```
 
 Handy flags: `--rates 0.2,0.5,0.8,1.0,1.5` (custom λ sweep),

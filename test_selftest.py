@@ -7,9 +7,9 @@ TTFT/ITL capture path, Poisson driver, metrics, and knee detection.
 import asyncio, json, time
 import httpx
 
-from voicesim.config import Config
-from voicesim.runner import run_sweep
-from voicesim.metrics import slo_knee, kneedle_knee, steps_to_rows
+from inference_simulator.config import Config
+from inference_simulator.runner import run_sweep
+from inference_simulator.metrics import slo_knee, kneedle_knee, steps_to_rows
 
 TTFT_BASE = 0.035
 KNEE_CONC = 8
