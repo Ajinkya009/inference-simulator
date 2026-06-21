@@ -101,11 +101,17 @@ async def _validate(cfg: Config):
               f"ITL_p95={sorted(m.itls_ms)[int(len(m.itls_ms)*0.95)] if m.itls_ms else 0:.1f}ms "
               f"n_out={m.n_output} prompt_tok={m.prompt_tokens} cached={m.cached_tokens}")
         if m.ok and m.cached_tokens >= cfg.system_prompt_tokens * 0.8:
-            print("[validate] OK: turn-2 reused the warm prefix (cache hit). "
-                  "Knee sweep will be meaningful.")
+            print("[validate] OK: turn-2 reused the warm prefix (cache hit "
+                  f"{m.cached_tokens} tok). Knee sweep will be meaningful.")
+        elif m.ok and m.cached_tokens == 0:
+            print("[validate] NOTE: cached_tokens=0 in the API response. If turn-2 "
+                  "TTFT above is far below a cold prefill of the full prompt, caching "
+                  "IS working but the server isn't reporting it -- add "
+                  "--enable-cache-report to the SGLang launch to surface the number. "
+                  "The TTFT/ITL knee from the sweep is valid either way.")
         elif m.ok:
-            print("[validate] WARN: low cache hit on turn 2 -- check that prefix "
-                  "caching/RadixAttention is enabled on the server.")
+            print(f"[validate] WARN: only {m.cached_tokens}/{cfg.system_prompt_tokens} "
+                  "prompt tokens cached on turn 2 -- prefix reuse looks partial.")
 
 
 def main():
