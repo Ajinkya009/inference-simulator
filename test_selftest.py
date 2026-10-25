@@ -10,6 +10,7 @@ import httpx
 from config import Config
 from runner import run_sweep
 from metrics import slo_knee, kneedle_knee, steps_to_rows
+from prompt import PromptFactory, TokenCounter
 
 TTFT_BASE = 0.035
 KNEE_CONC = 8
@@ -73,12 +74,21 @@ class MockTransport(httpx.AsyncBaseTransport):
                               stream=MockStream(items, on_close))
 
 async def main():
+    # Unit-level invariants that do not require a tokenizer download or GPU.
+    production = Config(prompt_sharing="shared", shared_prefix_tokens=120,
+                        customer_context_tokens=20, user_tokens=10, prompt_groups=2, seed=11)
+    factory = PromptFactory(production, TokenCounter(), __import__("random").Random(11))
+    factory.validate_shared_prefix()
+    assert factory.system_prefix(0) == factory.system_prefix(0)
+    assert factory.system_prefix(0) != factory.system_prefix(1)
+    assert len(factory.customer_context(__import__("random").Random(1)).split()) == 20
+    assert len(factory.user(__import__("random").Random(2)).split()) == 10
     cfg = Config(
         base_url="http://mock/v1", label="MOCK",
-        system_prompt_tokens=2000, inter_turn_gap_s=(0.3, 0.6),
-        turns=4, output_tokens=40,
-        arrival_rates=[0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0],
-        step_duration_s=6.0, warmup_s=1.0, cooldown_s=1.0,
+        system_prompt_tokens=200, inter_turn_gap_s=(0.01, 0.02),
+        turns=4, output_tokens=8, output_tokens_min=8, output_tokens_max=8,
+        arrival_rates=[2.0, 6.0, 12.0],
+        step_duration_s=1.0, warmup_s=0.2, cooldown_s=0.0, drain_s=0.5,
         ttft_slo_ms=120.0, seed=7,
     )
     steps = await run_sweep(cfg, transport=MockTransport())
@@ -93,6 +103,10 @@ async def main():
     assert any(s.n_turns > 0 for s in steps), "no turns measured"
     assert any(s.cache_hit_rate > 0.5 for s in steps), "cache parse broken"
     assert kk is not None, "knee detection failed"
+    # A content chunk is not a token: mock delivers one text fragment per
+    # token here, but client keeps exact text and separately tracks gaps.
+    assert any(r["completion_tokens"] == 8 and len(r["chunk_gaps_ms"]) == 7
+               for s in steps for r in s.request_records), "stream reconstruction/gaps broken"
     # TTFT should be ~flat then rise: last step p95 >> first step p95
     assert steps[-1].ttft_ms["p95"] > steps[0].ttft_ms["p95"] * 1.5, "no knee shape"
     print("SELF-TEST PASSED")

@@ -1,140 +1,45 @@
-"""Metric aggregation and knee detection.
-
-For each lambda step we collect TTFT and ITL samples from measured turns (2..N,
-post-warmup) and compute P50/P95/P99, throughput, error rate, cache-hit rate,
-and achieved concurrency (Little's law cross-check).
-
-Two knee definitions, both reported:
-  * SLO knee   : largest lambda whose P95 TTFT <= ttft_slo_ms. Most actionable.
-  * Kneedle knee: max-curvature elbow of the P95-TTFT-vs-lambda curve, even if
-                  it never crosses the SLO. Catches the inflection.
-"""
+"""Aggregation with all-attempt denominators for SLO goodput."""
 from __future__ import annotations
-
-import statistics
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional
-
+from dataclasses import asdict,dataclass,field
+from typing import List,Optional
 import numpy as np
-
 from client import TurnResult
-
-
+def _pct(xs):
+    if not xs:return {k:None for k in ("p50","p90","p95","p99","mean","max")}
+    a=np.asarray(xs,float);return {"p50":float(np.percentile(a,50)),"p90":float(np.percentile(a,90)),"p95":float(np.percentile(a,95)),"p99":float(np.percentile(a,99)),"mean":float(a.mean()),"max":float(a.max())}
 @dataclass
 class StepStats:
-    arrival_rate: float
-    n_turns: int = 0
-    n_errors: int = 0
-    ttft_ms: dict = field(default_factory=dict)
-    itl_ms: dict = field(default_factory=dict)
-    tpot_ms_mean: float = 0.0
-    throughput_turns_s: float = 0.0
-    output_tok_s: float = 0.0
-    cache_hit_rate: float = 0.0
-    mean_prompt_tokens: float = 0.0
-    achieved_concurrency: float = 0.0   # Little's law: lambda_turn * mean_total_s
-    error_rate: float = 0.0
-
-
-def _pct(xs: List[float]) -> dict:
-    if not xs:
-        return {"p50": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0, "max": 0.0}
-    a = np.asarray(xs, dtype=float)
-    return {
-        "p50": float(np.percentile(a, 50)),
-        "p95": float(np.percentile(a, 95)),
-        "p99": float(np.percentile(a, 99)),
-        "mean": float(a.mean()),
-        "max": float(a.max()),
-    }
-
-
+    arrival_rate:float; n_turns:int=0; n_errors:int=0; offered_calls:int=0; admitted_calls:int=0; completed_calls:int=0; dropped_calls:int=0; incomplete_calls:int=0
+    ttft_ms:dict=field(default_factory=dict); e2e_ms:dict=field(default_factory=dict); itl_ms:dict=field(default_factory=dict); per_turn_ttft:dict=field(default_factory=dict)
+    throughput_turns_s:float=0.; offered_calls_s:float=0.; admitted_calls_s:float=0.; completed_calls_s:float=0.; offered_llm_rps:float=0.; completed_llm_rps:float=0.; output_tok_s:float=0.
+    cache_hit_rate:Optional[float]=None; mean_prompt_tokens:float=0.; achieved_concurrency:float=0.; error_rate:float=0.; slo_goodput:float=0.; mean_active_calls:float=0.; peak_active_calls:int=0; mean_inflight_requests:float=0.; peak_inflight_requests:int=0; call_duration_s:dict=field(default_factory=dict)
+    request_records:List[dict]=field(default_factory=list)
 class StepCollector:
-    """Accumulates samples for one lambda step (warmup already filtered)."""
-
-    def __init__(self, arrival_rate: float):
-        self.arrival_rate = arrival_rate
-        self.ttft: List[float] = []
-        self.itl: List[float] = []
-        self.tpot: List[float] = []
-        self.total_s: List[float] = []
-        self.prompt_tokens: List[int] = []
-        self.cached_tokens: List[int] = []
-        self.n_turns = 0
-        self.n_errors = 0
-        self.n_output_tokens = 0
-
-    def add(self, res: TurnResult):
-        self.n_turns += 1
-        if not res.ok:
-            self.n_errors += 1
-            return
-        self.ttft.append(res.ttft_ms)
-        self.itl.extend(res.itls_ms)
-        if res.tpot_ms:
-            self.tpot.append(res.tpot_ms)
-        self.total_s.append(res.total_s)
-        self.prompt_tokens.append(res.prompt_tokens)
-        self.cached_tokens.append(res.cached_tokens)
-        self.n_output_tokens += res.n_output
-
-    def finalize(self, window_s: float) -> StepStats:
-        ok = self.n_turns - self.n_errors
-        pt = sum(self.prompt_tokens)
-        ct = sum(self.cached_tokens)
-        mean_total = statistics.mean(self.total_s) if self.total_s else 0.0
-        turn_rate = ok / window_s if window_s > 0 else 0.0
-        return StepStats(
-            arrival_rate=self.arrival_rate,
-            n_turns=self.n_turns,
-            n_errors=self.n_errors,
-            ttft_ms=_pct(self.ttft),
-            itl_ms=_pct(self.itl),
-            tpot_ms_mean=statistics.mean(self.tpot) if self.tpot else 0.0,
-            throughput_turns_s=turn_rate,
-            output_tok_s=self.n_output_tokens / window_s if window_s > 0 else 0.0,
-            cache_hit_rate=(ct / pt) if pt else 0.0,
-            mean_prompt_tokens=statistics.mean(self.prompt_tokens) if self.prompt_tokens else 0.0,
-            achieved_concurrency=turn_rate * mean_total,
-            error_rate=(self.n_errors / self.n_turns) if self.n_turns else 0.0,
-        )
-
-
-def slo_knee(steps: List[StepStats], slo_ms: float) -> Optional[float]:
-    """Largest arrival rate with P95 TTFT <= slo and no error blowup."""
-    passing = [s.arrival_rate for s in steps
-               if s.ttft_ms.get("p95", 1e9) <= slo_ms and s.error_rate < 0.02]
-    return max(passing) if passing else None
-
-
-def kneedle_knee(steps: List[StepStats]) -> Optional[float]:
-    """Max-curvature elbow of P95 TTFT vs arrival rate (normalized chord dist)."""
-    pts = [(s.arrival_rate, s.ttft_ms.get("p95", 0.0)) for s in steps]
-    pts = [p for p in pts if p[1] > 0]
-    if len(pts) < 3:
-        return None
-    xs = np.array([p[0] for p in pts], float)
-    ys = np.array([p[1] for p in pts], float)
-    xn = (xs - xs.min()) / (np.ptp(xs) or 1)
-    yn = (ys - ys.min()) / (np.ptp(ys) or 1)
-    # perpendicular distance of each point from the chord (first->last)
-    x0, y0, x1, y1 = xn[0], yn[0], xn[-1], yn[-1]
-    num = np.abs((y1 - y0) * xn - (x1 - x0) * yn + x1 * y0 - y1 * x0)
-    den = np.hypot(y1 - y0, x1 - x0) or 1
-    dist = num / den
-    return float(xs[int(dist.argmax())])
-
-
-def steps_to_rows(steps: List[StepStats]) -> List[dict]:
-    rows = []
-    for s in steps:
-        d = asdict(s)
-        d["ttft_p50"] = s.ttft_ms["p50"]
-        d["ttft_p95"] = s.ttft_ms["p95"]
-        d["ttft_p99"] = s.ttft_ms["p99"]
-        d["itl_p50"] = s.itl_ms["p50"]
-        d["itl_p95"] = s.itl_ms["p95"]
-        d["itl_p99"] = s.itl_ms["p99"]
-        del d["ttft_ms"], d["itl_ms"]
-        rows.append(d)
-    return rows
+ def __init__(self,rate):
+    self.arrival_rate=rate;self.records=[];self.calls=[];self.offered_calls=0;self.dropped_calls=0;self.active_samples=[];self.inflight_samples=[]
+ def add(self,res,turn=0,measured=True,**extra): self.records.append((res,turn,measured,extra))
+ def add_call(self,c):self.calls.append(c)
+ def finalize(self,window_s,slo_ms=300):
+    measured=[x for x in self.records if x[2]]; ok=[x for x in measured if x[0].ok]; rs=[x[0] for x in ok]
+    pts=[r.prompt_tokens for r in rs if r.prompt_tokens]; caches=[r.cached_tokens for r in rs if r.cached_tokens is not None]
+    by={str(t):_pct([r.ttft_ms for r,tt,_,_ in ok if tt==t]) for t in range(1,5)}
+    completed=sum(1 for c in self.calls if c.get("completed")); durations=[c["duration_s"] for c in self.calls]
+    n=len(measured); good=sum(1 for r in rs if r.ttft_ms<slo_ms)
+    records=[{"turn":t,"measured":m,"ok":r.ok,"ttft_ms":r.ttft_ms if r.ok else None,"e2e_ms":r.total_s*1000,"prompt_tokens":r.prompt_tokens,"cached_tokens":r.cached_tokens,"fresh_tokens":r.fresh_tokens,"completion_tokens":r.completion_tokens,"chunk_gaps_ms":r.chunk_gaps_ms,"error":r.error,**e} for r,t,m,e in self.records]
+    return StepStats(self.arrival_rate,n,len(measured)-len(ok),self.offered_calls,len(self.calls),completed,self.dropped_calls,max(0,len(self.calls)-completed),_pct([r.ttft_ms for r in rs]),_pct([r.total_s*1000 for r in rs]),_pct([g for r in rs for g in r.chunk_gaps_ms]),by,len(ok)/window_s,self.offered_calls/window_s,len(self.calls)/window_s,completed/window_s,n/window_s,len(ok)/window_s,sum((r.completion_tokens or 0) for r in rs)/window_s,(sum(caches)/sum(pts) if pts and len(caches)==len(rs) else None),(sum(pts)/len(pts) if pts else 0.),0.,((n-len(ok))/n if n else 0.),good/window_s,(sum(self.active_samples)/len(self.active_samples) if self.active_samples else 0.),max(self.active_samples or [0]),(sum(self.inflight_samples)/len(self.inflight_samples) if self.inflight_samples else 0.),max(self.inflight_samples or [0]),_pct(durations),records)
+def slo_knee(steps,slo_ms,min_samples=20,max_error_rate=.02):
+ p=[s.arrival_rate for s in steps if s.n_turns>=min_samples and s.ttft_ms.get("p95") is not None and s.ttft_ms["p95"]<=slo_ms and s.error_rate<=max_error_rate and not s.dropped_calls]
+ return max(p) if p else None
+def kneedle_knee(steps):
+ pts=[(s.arrival_rate,s.ttft_ms.get("p95")) for s in steps if s.ttft_ms.get("p95") is not None]
+ if len(pts)<3:return None
+ x=np.array([a for a,b in pts]);y=np.array([b for a,b in pts]);xn=(x-x.min())/(np.ptp(x)or 1);yn=(y-y.min())/(np.ptp(y)or 1);d=np.abs((yn[-1]-yn[0])*xn-(xn[-1]-xn[0])*yn+xn[-1]*yn[0]-yn[-1]*xn[0])/ (np.hypot(yn[-1]-yn[0],xn[-1]-xn[0])or 1);return float(x[d.argmax()])
+def steps_to_rows(steps):
+ out=[]
+ for s in steps:
+  d=asdict(s)
+  d.pop("request_records", None)
+  for n in ("ttft","e2e","itl"):
+   for k,v in d.pop(n+"_ms").items():d[f"{n}_{k}"]=v
+  out.append(d)
+ return out

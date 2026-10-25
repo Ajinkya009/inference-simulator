@@ -1,0 +1,12 @@
+# Local Python environments and interpreter artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.env
+uv.lock
+
+# Local interpreter selection
+.python-version
+
+# Generated benchmark artifacts
+results/

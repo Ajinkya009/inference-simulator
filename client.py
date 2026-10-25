@@ -1,114 +1,47 @@
-"""Streaming client + per-request latency capture.
-
-TTFT  = wall time from just-before-send to the first non-empty content delta
-        (includes server queueing -- exactly what production feels).
-ITL   = gaps between consecutive output tokens (one sample per token gap).
-TPOT  = (last_token_time - first_token_time) / (n_tokens - 1).
-"""
+"""Streaming OpenAI client. Chunk timing is deliberately not token timing."""
 from __future__ import annotations
-
-import json
-import time
-from dataclasses import dataclass, field
-from typing import List, Optional
-
+import json,time
+from dataclasses import dataclass,field
+from typing import List,Optional
 import httpx
-
-
 @dataclass
 class TurnResult:
-    ok: bool
-    ttft_ms: float = 0.0
-    itls_ms: List[float] = field(default_factory=list)   # per-token gaps
-    n_output: int = 0
-    prompt_tokens: int = 0
-    cached_tokens: int = 0
-    total_s: float = 0.0
-    error: Optional[str] = None
-
+    ok:bool; assistant_text:str=""; ttft_ms:float=0.; transport_first_ms:float=0.; itls_ms:List[float]=field(default_factory=list) # compatibility: content chunk gaps
+    chunk_gaps_ms:List[float]=field(default_factory=list); n_output:int=0; completion_tokens:Optional[int]=None
+    prompt_tokens:int=0; cached_tokens:Optional[int]=None; fresh_tokens:Optional[int]=None; total_s:float=0.; error:Optional[str]=None; http_status:Optional[int]=None; finish_reason:Optional[str]=None; content_timestamps:List[float]=field(default_factory=list)
     @property
-    def tpot_ms(self) -> float:
-        if self.n_output <= 1:
-            return 0.0
-        # mean of inter-token gaps == TPOT
-        return sum(self.itls_ms) / len(self.itls_ms) if self.itls_ms else 0.0
-
-
-async def stream_chat(client: httpx.AsyncClient, model: str,
-                      messages: list, max_tokens: int,
-                      ignore_eos: bool, temperature: float) -> TurnResult:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
-    if ignore_eos:
-        # SGLang extension: forces exactly max_tokens output for clean ITL.
-        payload["ignore_eos"] = True
-    # SGLang: include cached_tokens in usage.prompt_tokens_details.
-    payload["return_cached_tokens_details"] = True
-
-    t_start = time.perf_counter()
-    first_tok_t: Optional[float] = None
-    last_tok_t: Optional[float] = None
-    itls: List[float] = []
-    n_out = 0
-    usage = {}
-
+    def tpot_ms(self):
+        # Only accurate if server reports completion count AND chunks map 1:1; do not claim it otherwise.
+        return None
+async def stream_chat(client:httpx.AsyncClient,model:str,messages:list,max_tokens:int,ignore_eos:bool,temperature:float)->TurnResult:
+    payload={"model":model,"messages":messages,"max_tokens":max_tokens,"temperature":temperature,"stream":True,"stream_options":{"include_usage":True},"return_cached_tokens_details":True}
+    if ignore_eos: payload["ignore_eos"]=True
+    start=time.monotonic(); first_event=None; first_content=None; last_content=None; chunks=[]; gaps=[]; usage={}; finish=None
     try:
-        async with client.stream("POST", "/chat/completions",
-                                 json=payload) as resp:
-            if resp.status_code != 200:
-                body = (await resp.aread()).decode("utf-8", "ignore")[:200]
-                return TurnResult(ok=False, error=f"HTTP {resp.status_code}: {body}",
-                                  total_s=time.perf_counter() - t_start)
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                content = delta.get("content")
-                if not content:
-                    continue
-
-                now = time.perf_counter()
-                if first_tok_t is None:
-                    first_tok_t = now
-                else:
-                    itls.append((now - last_tok_t) * 1000.0)
-                last_tok_t = now
-                n_out += 1
-    except (httpx.HTTPError, httpx.StreamError) as e:
-        return TurnResult(ok=False, error=str(e),
-                          total_s=time.perf_counter() - t_start)
-
-    if first_tok_t is None:
-        return TurnResult(ok=False, error="no tokens streamed",
-                          total_s=time.perf_counter() - t_start)
-
-    from prompt import measured_prompt_tokens, cached_prompt_tokens
-    return TurnResult(
-        ok=True,
-        ttft_ms=(first_tok_t - t_start) * 1000.0,
-        itls_ms=itls,
-        n_output=n_out,
-        prompt_tokens=measured_prompt_tokens(usage),
-        cached_tokens=cached_prompt_tokens(usage),
-        total_s=time.perf_counter() - t_start,
-    )
+      async with client.stream("POST","/chat/completions",json=payload) as resp:
+        if resp.status_code!=200:
+          body=(await resp.aread()).decode("utf-8","ignore")[:200]; return TurnResult(False,total_s=time.monotonic()-start,error=f"HTTP {resp.status_code}: {body}",http_status=resp.status_code)
+        async for line in resp.aiter_lines():
+          if not line or not line.startswith("data:"): continue
+          now=time.monotonic(); first_event=first_event or now; data=line[5:].strip()
+          if data=="[DONE]": break
+          try: chunk=json.loads(data)
+          except json.JSONDecodeError: continue
+          if chunk.get("usage"): usage=chunk["usage"]
+          choices=chunk.get("choices") or []
+          if not choices: continue
+          choice=choices[0]; finish=choice.get("finish_reason") or finish; delta=choice.get("delta") or {}
+          # Content only: role/reasoning/tool metadata must not establish voice TTFT.
+          content=delta.get("content")
+          if isinstance(content,str) and content:
+            if first_content is None: first_content=now
+            elif last_content is not None: gaps.append((now-last_content)*1000.)
+            last_content=now; chunks.append(content)
+    except (httpx.HTTPError,httpx.StreamError,TimeoutError) as e:
+      return TurnResult(False,total_s=time.monotonic()-start,error=str(e))
+    total=time.monotonic()-start
+    if first_content is None: return TurnResult(False,total_s=total,error="stream ended without assistant content",finish_reason=finish)
+    from prompt import measured_prompt_tokens,cached_prompt_tokens
+    pt=measured_prompt_tokens(usage); cached=cached_prompt_tokens(usage)
+    completion=(usage or {}).get("completion_tokens")
+    return TurnResult(True,assistant_text="".join(chunks),ttft_ms=(first_content-start)*1000.,transport_first_ms=((first_event-start)*1000. if first_event else 0.),itls_ms=gaps,chunk_gaps_ms=gaps,n_output=(int(completion) if completion is not None else 0),completion_tokens=(int(completion) if completion is not None else None),prompt_tokens=pt,cached_tokens=cached,fresh_tokens=(max(0,pt-cached) if cached is not None else None),total_s=total,http_status=200,finish_reason=finish,content_timestamps=[])

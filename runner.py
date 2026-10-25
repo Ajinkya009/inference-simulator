@@ -1,101 +1,47 @@
-"""Open-loop Poisson arrival driver + lambda sweep.
-
-Open-loop = arrivals are independent of completions (true Poisson). If the
-server can't keep up, calls pile up and latency grows super-linearly -- that
-pileup is exactly what reveals the knee. A safety cap (max_concurrent_calls)
-prevents the client itself from OOMing during collapse.
-"""
+"""Open-loop Poisson call driver; admission rejection never changes arrivals."""
 from __future__ import annotations
-
-import asyncio
-import random
-import time
-from typing import List
-
+import asyncio,random,time
 import httpx
-
 from call import run_call
-from client import TurnResult
 from config import Config
-from metrics import StepCollector, StepStats
-from prompt import calibrate
-
-
-def _make_client(cfg: Config, transport=None) -> httpx.AsyncClient:
-    limits = httpx.Limits(max_connections=cfg.max_connections,
-                          max_keepalive_connections=cfg.max_connections)
-    timeout = httpx.Timeout(cfg.request_timeout_s, connect=cfg.connect_timeout_s)
-    headers = {"Authorization": f"Bearer {cfg.api_key}"}
-    return httpx.AsyncClient(base_url=cfg.base_url, limits=limits,
-                             timeout=timeout, headers=headers,
-                             transport=transport)
-
-
-async def _run_step(cfg: Config, client: httpx.AsyncClient, lam: float,
-                    tpw: float, rng: random.Random) -> StepStats:
-    collector = StepCollector(lam)
-    inflight: set = set()
-    t_step_start = time.perf_counter()
-    warmup_until = t_step_start + cfg.warmup_s
-    step_until = t_step_start + cfg.step_duration_s
-    call_idx = 0
-    measured_window_start = None
-
-    def emit(ci: int, ti: int, offset: float, res: TurnResult):
-        # Only keep samples that LANDED inside the steady-state window.
-        nonlocal measured_window_start
-        now = time.perf_counter()
-        if now < warmup_until:
-            return
-        if measured_window_start is None:
-            measured_window_start = now
-        collector.add(res)
-
-    # Poisson arrivals: exponential inter-arrival with mean 1/lam.
-    while time.perf_counter() < step_until:
-        if len(inflight) < cfg.max_concurrent_calls:
-            task = asyncio.create_task(
-                run_call(call_idx, client, cfg, tpw,
-                         rng, t_step_start, emit))
-            inflight.add(task)
-            task.add_done_callback(inflight.discard)
-            call_idx += 1
-        # next arrival
-        await asyncio.sleep(rng.expovariate(lam))
-
-    # Drain remaining in-flight calls (bounded by cooldown).
-    if inflight:
-        try:
-            await asyncio.wait(inflight, timeout=cfg.cooldown_s)
-        except Exception:  # noqa: BLE001
-            pass
-    for t in list(inflight):
-        t.cancel()
-
-    window = (time.perf_counter() - measured_window_start
-              if measured_window_start else cfg.step_duration_s - cfg.warmup_s)
-    stats = collector.finalize(max(window, 1e-3))
-    return stats
-
-
-async def run_sweep(cfg: Config, progress=print, transport=None) -> List[StepStats]:
-    rng = random.Random(cfg.seed)
-    results: List[StepStats] = []
-    async with _make_client(cfg, transport=transport) as client:
-        progress(f"[{cfg.label}] calibrating tokenizer against {cfg.base_url} ...")
-        tpw = await calibrate(client, cfg.model, rng)
-        progress(f"[{cfg.label}] tokens/word = {tpw:.3f} "
-                 f"(target system prompt = {cfg.system_prompt_tokens} tok)")
-
-        for lam in cfg.arrival_rates:
-            progress(f"[{cfg.label}] lambda={lam:.3f} calls/s  "
-                     f"(window {cfg.step_duration_s:.0f}s, warmup {cfg.warmup_s:.0f}s) ...")
-            stats = await _run_step(cfg, client, lam, tpw, rng)
-            results.append(stats)
-            progress(f"    -> turns={stats.n_turns} err={stats.error_rate:.1%} "
-                     f"TTFT p95={stats.ttft_ms['p95']:.0f}ms "
-                     f"ITL p95={stats.itl_ms['p95']:.1f}ms "
-                     f"cache_hit={stats.cache_hit_rate:.0%} "
-                     f"conc~{stats.achieved_concurrency:.1f}")
-            await asyncio.sleep(cfg.cooldown_s)
-    return results
+from metrics import StepCollector
+from prompt import PromptFactory,make_counter
+def _make_client(cfg,transport=None):
+ return httpx.AsyncClient(base_url=cfg.base_url,limits=httpx.Limits(max_connections=cfg.max_connections,max_keepalive_connections=cfg.max_connections),timeout=httpx.Timeout(cfg.request_timeout_s,connect=cfg.connect_timeout_s),headers={"Authorization":f"Bearer {cfg.api_key}"},transport=transport)
+async def _run_step(cfg,client,lam,factory,rng):
+ c=StepCollector(lam); tasks=set(); start=time.monotonic(); measure_start=start+cfg.warmup_s; measure_end=measure_start+cfg.step_duration_s
+ def emit(ci,ti,t,res,measured,group,cold):
+  # Selection is by request start, not completion; static warm requests stay recorded but unmeasured.
+  if measured and measure_start<=t<measure_end:c.add(res,ti,True,call_id=ci,group=group,cold=cold,start_monotonic=t)
+ async def wrapped(idx,call_start):
+  result=await run_call(idx,client,cfg,factory,random.Random(rng.randrange(2**63)),call_start,emit)
+  if measure_start<=call_start<measure_end:c.add_call(result)
+ # Poisson offered stream spans warmup plus measurement. It never waits on calls.
+ idx=0; next_at=start
+ while next_at<measure_end:
+  await asyncio.sleep(max(0,next_at-time.monotonic())); offered_at=next_at; in_measure=measure_start<=offered_at<measure_end
+  if in_measure:c.offered_calls+=1
+  if len(tasks)>=cfg.max_concurrent_calls:
+   if in_measure:c.dropped_calls+=1
+  else:
+   task=asyncio.create_task(wrapped(idx,offered_at));tasks.add(task);task.add_done_callback(tasks.discard);idx+=1
+  c.active_samples.append(len(tasks)); next_at+=rng.expovariate(lam)
+ # Drain without cancellation; explicitly report unfinished work at deadline.
+ deadline=time.monotonic()+cfg.drain_s
+ while tasks and time.monotonic()<deadline:
+  c.active_samples.append(len(tasks)); await asyncio.sleep(min(.1,max(.001,deadline-time.monotonic())))
+ for task in list(tasks): task.cancel()
+ await asyncio.gather(*tasks,return_exceptions=True)
+ return c.finalize(cfg.step_duration_s,cfg.ttft_slo_ms)
+async def run_sweep(cfg:Config,progress=print,transport=None):
+ rng=random.Random(cfg.seed);results=[]
+ async with _make_client(cfg,transport) as client:
+  progress(f"[{cfg.label}] loading tokenizer (tokenizer files only; server fallback if unavailable) ...")
+  counter=await make_counter(client,cfg.model,rng,cfg.tokenizer_local_only);factory=PromptFactory(cfg,counter,rng);factory.validate_shared_prefix()
+  progress(f"[{cfg.label}] prefix content tokens={counter.count(factory.system_prefix(0)) if cfg.prompt_sharing!='unique' else cfg.shared_prefix_tokens}")
+  for lam in cfg.arrival_rates:
+   progress(f"[{cfg.label}] offered={lam:.3f} calls/s warmup={cfg.warmup_s:.0f}s measurement={cfg.step_duration_s:.0f}s")
+   s=await _run_step(cfg,client,lam,factory,rng);results.append(s)
+   p=s.ttft_ms.get("p95");progress(f" -> requests={s.n_turns} err={s.error_rate:.1%} p95={p if p is not None else 'n/a'}ms goodput={s.slo_goodput:.2f}/s drops={s.dropped_calls}")
+   if cfg.cooldown_s:await asyncio.sleep(cfg.cooldown_s)
+ return results

@@ -1,73 +1,42 @@
-"""A single call = one Poisson arrival.
-
-Lifecycle (production-faithful):
-  turn 1: send [system(18K) + user1], decode 1 token, DISCARD (static reply).
-          -> warms the unique per-call prefix in SGLang's radix cache.
-  gap (5-7s)  # user speaking / ASR
-  turn 2: send [system + user1 + static1 + user2], stream 100 tok. MEASURED.
-  gap
-  turn 3: + static2 ... wait, turns 2..N responses come from the LLM, so the
-          assistant content we carry forward is the model's own output.
-  ...
-Full history is carried forward every turn (input grows by ~user+assistant
-each turn). The system prefix stays identical -> warm path on turns 2..N.
-"""
+"""One telephone call and its sequential multi-turn LLM lifecycle."""
 from __future__ import annotations
-
-import asyncio
-import random
-import time
-from typing import Callable, List
-
-import httpx
-
+import asyncio, random, time
+from typing import Callable
 from client import stream_chat, TurnResult
-from config import Config
-from prompt import build_system_prompt, build_user_message
 
+async def run_call(call_idx, client, cfg, factory, rng, call_start, emit:Callable):
+    """Run one call. `emit` receives every attempted LLM turn, including errors.
 
-async def run_call(call_idx: int, client: httpx.AsyncClient, cfg: Config,
-                   tpw: float, rng: random.Random,
-                   t_step_start: float,
-                   emit: Callable[[int, int, float, TurnResult], None]) -> None:
-    """Run one full call. `emit(call_idx, turn_idx, arrival_offset, result)`
-    is called for every MEASURED turn (2..N)."""
-    system_prompt = build_system_prompt(cfg.system_prompt_tokens, tpw, rng)
-    messages: List[dict] = [{"role": "system", "content": system_prompt}]
-
-    # ---- turn 1: warm the prefix, response ignored ----------------------
-    messages.append({"role": "user",
-                     "content": build_user_message(cfg.user_tokens, tpw, rng)})
-    try:
-        await stream_chat(client, cfg.model, messages,
-                          max_tokens=cfg.warm_turn1_max_tokens,
-                          ignore_eos=False, temperature=cfg.temperature)
-    except Exception:  # noqa: BLE001
-        pass
-    # Append the STATIC turn-1 assistant response (not from the LLM).
-    messages.append({"role": "assistant",
-                     "content": build_user_message(cfg.static_response_tokens, tpw, rng)})
-
-    # ---- turns 2..N: measured ------------------------------------------
-    for turn_idx in range(2, cfg.turns + 1):
-        gap = rng.uniform(*cfg.inter_turn_gap_s)
-        await asyncio.sleep(gap)
-
-        messages.append({"role": "user",
-                         "content": build_user_message(cfg.user_tokens, tpw, rng)})
-        offset = time.perf_counter() - t_step_start
-        res = await stream_chat(client, cfg.model, messages,
-                                max_tokens=cfg.output_tokens,
-                                ignore_eos=cfg.ignore_eos,
-                                temperature=cfg.temperature)
-        emit(call_idx, turn_idx, offset, res)
-
-        # Carry the model's own output forward as conversation history.
-        if res.ok:
-            messages.append({"role": "assistant",
-                             "content": "(generated) " +
-                             build_user_message(cfg.output_tokens, tpw, rng)})
-        else:
-            # On failure, still advance history with a placeholder so token
-            # accounting stays comparable.
-            messages.append({"role": "assistant", "content": "(error)"})
+    Failure policy is stop-call: a failed response is recorded and no invented
+    assistant message is put into subsequent history.
+    """
+    nturns=3 if rng.random()<cfg.three_turn_probability else cfg.turns
+    group=factory.group_for(rng); cold=(cfg.prompt_sharing=="partial-miss" and rng.random()<cfg.cold_miss_percent/100.)
+    messages=[{"role":"system","content":factory.system_prefix(group,cold)}]
+    context=factory.customer_context(rng)
+    if context: messages.append({"role":"system","content":context})
+    schedule=cfg.turn_schedule_3 if nturns==3 else cfg.turn_schedule_4
+    completed=True
+    for turn in range(1,nturns+1):
+        if cfg.timing_mode=="scheduled":
+            target=call_start+schedule[min(turn-1,len(schedule)-1)]+rng.uniform(-cfg.schedule_jitter_s,cfg.schedule_jitter_s)
+            await asyncio.sleep(max(0.,target-time.monotonic()))
+        elif cfg.timing_mode=="fixed-gap" and turn>1: await asyncio.sleep(rng.uniform(*cfg.inter_turn_gap_s))
+        if cfg.customer_context_each_turn and turn>1 and context: messages.append({"role":"system","content":factory.customer_context(rng)})
+        messages.append({"role":"user","content":factory.user(rng)})
+        start=time.monotonic()
+        if turn==1 and cfg.first_turn_mode=="static_first_turn":
+            # Legacy behavior remains explicit: prefill request is recorded but not a measured LLM reply.
+            res=await stream_chat(client,cfg.model,messages,cfg.warm_turn1_max_tokens,False,cfg.temperature)
+            emit(call_idx,turn,start,res,False,group,cold)
+            if not res.ok: completed=False; break
+            messages.append({"role":"assistant","content":factory.user(rng)})
+            continue
+        maximum=rng.randint(cfg.output_tokens_min,cfg.output_tokens_max)
+        res=await stream_chat(client,cfg.model,messages,maximum,cfg.ignore_eos,cfg.temperature)
+        emit(call_idx,turn,start,res,True,group,cold)
+        if not res.ok:
+            completed=False; break
+        # Exact reconstructed response is the next-turn assistant context.
+        messages.append({"role":"assistant","content":res.assistant_text})
+    return {"call_id":call_idx,"turns":nturns,"completed":completed,"duration_s":time.monotonic()-call_start,"group":group,"cold":cold}

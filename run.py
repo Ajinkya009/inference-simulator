@@ -25,12 +25,21 @@ def _apply_cli(cfg: Config, args) -> Config:
     if getattr(args, "preset", None):
         for k, v in PRESETS[args.preset].items():
             setattr(cfg, k, v)
-    for attr in ("base_url", "model", "label", "out_dir"):
+    for attr in ("base_url", "model", "label", "out_dir", "prompt_sharing", "timing_mode"):
         v = getattr(args, attr, None)
         if v is not None:
             setattr(cfg, attr, v)
     if getattr(args, "system_prompt_tokens", None):
         cfg.system_prompt_tokens = args.system_prompt_tokens
+        cfg.shared_prefix_tokens = args.system_prompt_tokens
+    for arg, attr in (("shared_prefix_tokens", "shared_prefix_tokens"), ("customer_context_tokens", "customer_context_tokens"),
+                      ("user_tokens", "user_tokens"), ("warmup", "warmup_s"), ("measurement", "step_duration_s"),
+                      ("drain", "drain_s"), ("groups", "prompt_groups"), ("seed", "seed"), ("mean_call_duration", "mean_call_duration_s")):
+        v = getattr(args, arg, None)
+        if v is not None: setattr(cfg, attr, v)
+    if getattr(args, "three_turn_probability", None) is not None: cfg.three_turn_probability=args.three_turn_probability
+    if getattr(args, "output_tokens", None):
+        a,b=(int(x) for x in args.output_tokens.split(":",1));cfg.output_tokens_min=a;cfg.output_tokens_max=b;cfg.output_tokens=(a+b)//2
     if getattr(args, "rates", None):
         cfg.arrival_rates = [float(x) for x in args.rates.split(",")]
     if getattr(args, "step_duration", None):
@@ -43,7 +52,7 @@ def _apply_cli(cfg: Config, args) -> Config:
 def _write_outputs(cfg: Config, steps):
     os.makedirs(cfg.out_dir, exist_ok=True)
     rows = steps_to_rows(steps)
-    sk = slo_knee(steps, cfg.ttft_slo_ms)
+    sk = slo_knee(steps, cfg.ttft_slo_ms, cfg.min_knee_samples, cfg.max_error_rate)
     kk = kneedle_knee(steps)
     base = os.path.join(cfg.out_dir, cfg.label)
 
@@ -52,6 +61,13 @@ def _write_outputs(cfg: Config, steps):
             "timestamp": time.time()}
     with open(base + ".json", "w") as f:
         json.dump(blob, f, indent=2)
+
+    # JSON Lines supports independent analysis without parsing summary tables.
+    # It intentionally excludes prompt text and credentials.
+    with open(base + ".turns.jsonl", "w") as f:
+        for step in steps:
+            for record in step.request_records:
+                f.write(json.dumps({"arrival_rate": step.arrival_rate, **record}) + "\n")
 
     # CSV
     import csv
@@ -74,7 +90,7 @@ def _write_outputs(cfg: Config, steps):
           f"{('λ=%.3f calls/s' % sk) if sk else 'NONE (SLO never met)'}")
     print(f"  Curvature knee (elbow):           "
           f"{('λ=%.3f calls/s' % kk) if kk else 'n/a'}")
-    print(f"  Outputs: {base}.json / .csv / .png")
+    print(f"  Outputs: {base}.json / .csv / .turns.jsonl / .png")
     print("=" * 64)
 
 
@@ -100,10 +116,10 @@ async def _validate(cfg: Config):
         print(f"[validate] turn2 (measured): ok={m.ok} TTFT={m.ttft_ms:.0f}ms "
               f"ITL_p95={sorted(m.itls_ms)[int(len(m.itls_ms)*0.95)] if m.itls_ms else 0:.1f}ms "
               f"n_out={m.n_output} prompt_tok={m.prompt_tokens} cached={m.cached_tokens}")
-        if m.ok and m.cached_tokens >= cfg.system_prompt_tokens * 0.8:
+        if m.ok and m.cached_tokens is not None and m.cached_tokens >= cfg.system_prompt_tokens * 0.8:
             print("[validate] OK: turn-2 reused the warm prefix (cache hit "
                   f"{m.cached_tokens} tok). Knee sweep will be meaningful.")
-        elif m.ok and m.cached_tokens == 0:
+        elif m.ok and (m.cached_tokens is None or m.cached_tokens == 0):
             print("[validate] NOTE: cached_tokens=0 in the API response. If turn-2 "
                   "TTFT above is far below a cold prefill of the full prompt, caching "
                   "IS working but the server isn't reporting it -- add "
@@ -128,6 +144,19 @@ def main():
         sp.add_argument("--step-duration", type=float)
         sp.add_argument("--slo", type=float, help="P95 TTFT SLO in ms")
         sp.add_argument("--out-dir", default=None)
+        sp.add_argument("--prompt-sharing", choices=["shared", "unique", "multi-template", "partial-miss"])
+        sp.add_argument("--shared-prefix-tokens", type=int)
+        sp.add_argument("--customer-context-tokens", type=int)
+        sp.add_argument("--user-tokens", type=int)
+        sp.add_argument("--output-tokens", help="min:max, e.g. 50:100")
+        sp.add_argument("--three-turn-probability", type=float)
+        sp.add_argument("--timing-mode", choices=["immediate", "fixed-gap", "scheduled", "trace"])
+        sp.add_argument("--groups", type=int)
+        sp.add_argument("--warmup", type=float)
+        sp.add_argument("--measurement", type=float)
+        sp.add_argument("--drain", type=float)
+        sp.add_argument("--mean-call-duration", type=float)
+        sp.add_argument("--seed", type=int)
 
     sw = sub.add_parser("sweep"); common(sw)
     va = sub.add_parser("validate"); common(va)
